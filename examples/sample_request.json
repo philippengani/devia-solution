@@ -1,0 +1,11 @@
+{
+  "product_name": "iPhone 15",
+  "market": "CA",
+  "competitors": ["Amazon", "Best Buy", "Walmart"],
+  "include_recommendations": true,
+  "customer_reviews": [
+    "Great product and very reliable",
+    "Premium feel but expensive",
+    "Fast delivery and good quality"
+  ]
+}

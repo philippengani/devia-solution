@@ -26,6 +26,9 @@ The implementation respects the brief:
   - market trend analyzer tool
   - report generator tool
 - deterministic mocked market data for reproducible evaluation
+- optional LLM-backed sentiment analysis with deterministic fallback
+- Langfuse prompt registry integration for the sentiment prompt
+- Langfuse request and step tracing when credentials are configured
 - tool execution tracing and output metadata
 - Docker packaging
 - focused test suite for tools, orchestration, validation, and errors
@@ -94,11 +97,11 @@ README.md
 
 ### Local run
 
-Python 3.12 is the target runtime for this repo. The current code was validated in the local Python 3.12 environment and the Docker image now uses Python 3.12 as well.
+Python 3.13 is the target runtime for this repo. The current code was validated in the local Python 3.13 environment and the Docker image now uses Python 3.13 as well.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python3.13 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --reload
 ```
@@ -109,6 +112,16 @@ Configure the container environment in `.env` first. For OpenAI-backed report sy
 - `OPENAI_API_KEY`
 - `LLM_ENABLED=true`
 - `REPORT_SYNTHESIS_MODE=openai_compatible`
+
+For LLM-backed sentiment analysis with Langfuse-managed prompts and tracing, also set:
+- `SENTIMENT_ANALYSIS_MODE=llm`
+- `LANGFUSE_PUBLIC_KEY`
+- `LANGFUSE_SECRET_KEY`
+- `LANGFUSE_BASE_URL`
+- `SENTIMENT_PROMPT_NAME=sentiment-analyzer`
+- `SENTIMENT_PROMPT_LABEL=production`
+- `REPORT_PROMPT_NAME=market-analysis-report-generator`
+- `REPORT_PROMPT_LABEL=production`
 
 ```bash
 docker compose up --build
@@ -134,11 +147,19 @@ curl -X POST http://localhost:8000/analyze \
 |---|---|---|
 | `ORCHESTRATION_MODE` | `langgraph` | `langgraph` or `native` |
 | `REPORT_SYNTHESIS_MODE` | `template` | `template` or `openai_compatible` |
+| `SENTIMENT_ANALYSIS_MODE` | `heuristic` | `heuristic` or `llm` |
 | `LLM_ENABLED` | `false` | enables the optional LLM summary path |
 | `OPENAI_API_KEY` | unset | OpenAI API key; the app will use this directly |
 | `LLM_API_KEY` | unset | API key for an OpenAI-compatible endpoint |
 | `LLM_BASE_URL` | `https://api.openai.com/v1` | base URL for the compatible chat API |
 | `LLM_MODEL` | `gpt-4o-mini` | model name for optional synthesis |
+| `LANGFUSE_PUBLIC_KEY` | unset | Langfuse public API key used for prompt fetch and tracing |
+| `LANGFUSE_SECRET_KEY` | unset | Langfuse secret API key used for prompt fetch and tracing |
+| `LANGFUSE_BASE_URL` | `https://cloud.langfuse.com` | Langfuse base URL; use the US cloud URL if your project is in that region |
+| `SENTIMENT_PROMPT_NAME` | `sentiment-analyzer` | Langfuse prompt name for the sentiment chat prompt |
+| `SENTIMENT_PROMPT_LABEL` | `production` | Langfuse label used to fetch the runtime prompt version |
+| `REPORT_PROMPT_NAME` | `market-analysis-report-generator` | Langfuse prompt name for the report generation chat prompt |
+| `REPORT_PROMPT_LABEL` | `production` | Langfuse label used to fetch the runtime report prompt version |
 | `REQUEST_TIMEOUT_SECONDS` | `20` | outbound timeout for the optional LLM call |
 
 ### `.env` with Docker Compose
@@ -151,10 +172,18 @@ Minimal OpenAI-enabled `.env`:
 APP_ENV=local
 ORCHESTRATION_MODE=langgraph
 REPORT_SYNTHESIS_MODE=openai_compatible
+SENTIMENT_ANALYSIS_MODE=llm
 LLM_ENABLED=true
 OPENAI_API_KEY=sk-your-openai-key
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_MODEL=gpt-4o-mini
+LANGFUSE_PUBLIC_KEY=pk-lf-your-public-key
+LANGFUSE_SECRET_KEY=sk-lf-your-secret-key
+LANGFUSE_BASE_URL=https://cloud.langfuse.com
+SENTIMENT_PROMPT_NAME=sentiment-analyzer
+SENTIMENT_PROMPT_LABEL=production
+REPORT_PROMPT_NAME=market-analysis-report-generator
+REPORT_PROMPT_LABEL=production
 REQUEST_TIMEOUT_SECONDS=20
 ```
 
@@ -163,6 +192,29 @@ REQUEST_TIMEOUT_SECONDS=20
 The report generator can optionally use an OpenAI-compatible `chat/completions` endpoint for the executive summary and key findings. If the call fails, the system automatically falls back to the deterministic template path and records a warning.
 
 That keeps the project aligned with the test's LLM/agent expectations without making the demo dependent on paid APIs.
+
+### Langfuse-backed LLM modes
+
+The app now uses Langfuse-managed prompts for both LLM-capable paths:
+- `heuristic` keeps the original deterministic keyword-based analyzer.
+- `llm` for sentiment fetches a chat prompt from Langfuse, runs sentiment through the Langfuse OpenAI integration, and links the prompt version to the generation trace.
+- `openai_compatible` for report synthesis now also fetches its chat prompt from Langfuse and executes the report LLM call through the same Langfuse OpenAI integration.
+
+If the Langfuse prompt fetch, tracing setup, or LLM call fails, the app falls back to the heuristic sentiment analyzer and records a warning in the response metadata/tool execution details instead of failing the request.
+
+The sentiment prompt contract is fixed:
+- Prompt type: `chat`
+- Prompt name: `sentiment-analyzer` by default
+- Variables: `review_count`, `reviews_json`
+- Expected output: JSON matching the sentiment response fields except `review_count`, which is set in code
+
+The report prompt contract is fixed:
+- Prompt type: `chat`
+- Prompt name: `market-analysis-report-generator` by default
+- Variables: `request_json`, `product_data_json`, `sentiment_json`, `trend_json`
+- Expected output: JSON with `executive_summary` and `key_findings`, where `key_findings` contains exactly 3 concise strings
+
+Prompt creation and version promotion are intentionally managed in Langfuse UI or CLI, not in the application code. The app always fetches the prompt version labeled `production` unless you override `SENTIMENT_PROMPT_LABEL` or `REPORT_PROMPT_LABEL`.
 
 ## 6. API contract
 

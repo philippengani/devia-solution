@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from hashlib import sha256
 from time import perf_counter
+from typing import Any
 from typing import Optional
 from uuid import uuid4
 
@@ -17,6 +18,7 @@ from app.models.schemas import (
     ToolExecution,
     TrendOutput,
 )
+from app.services.langfuse_observability import LangfuseObservability
 from app.services.report_narrative import ReportNarrativeService
 from app.tools.product_data_tool import ProductDataTool
 from app.tools.report_tool import ReportGeneratorTool
@@ -29,10 +31,20 @@ class BaseMarketAnalysisOrchestrator:
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
         self.settings = settings or get_settings()
+        self.observability = LangfuseObservability(self.settings)
         self.product_tool = ProductDataTool()
-        self.sentiment_tool = SentimentAnalyzerTool()
+        self.sentiment_tool = SentimentAnalyzerTool(
+            self.settings,
+            langfuse_client=self.observability.get_client(),
+        )
         self.trend_tool = MarketTrendAnalyzerTool()
-        self.report_tool = ReportGeneratorTool(ReportNarrativeService(self.settings))
+        self.report_tool = ReportGeneratorTool(
+            ReportNarrativeService(
+                self.settings,
+                langfuse_client=self.observability.get_client(),
+            )
+        )
+        self.current_langfuse_trace_id: Optional[str] = None
 
     def _build_analysis_id(self, request: AnalyzeRequest) -> str:
         request_fingerprint = sha256(
@@ -90,8 +102,13 @@ class BaseMarketAnalysisOrchestrator:
         started_at = datetime.now(timezone.utc)
         started = perf_counter()
 
+        span_input = {'step_name': step_name, **(details or {})}
+
         try:
-            result = run_callable()
+            with self.observability.start_step(step_name=step_name, input_data=span_input, metadata=details) as span:
+                result = run_callable()
+                if span is not None:
+                    span.update(output={'status': 'success'})
         except Exception as exc:
             raise ToolExecutionError(tool_name, str(exc)) from exc
 
@@ -107,6 +124,26 @@ class BaseMarketAnalysisOrchestrator:
             details=details or {},
         )
         return result, record
+
+    def _run_plan_step(self, request: AnalyzeRequest) -> tuple[AnalysisPlan, list[str]]:
+        with self.observability.start_step(
+            step_name='plan_analysis',
+            input_data={
+                'product_name': request.product_name,
+                'market': request.market,
+                'has_reviews': bool(request.customer_reviews),
+            },
+            metadata={'competitor_count': len(request.competitors)},
+        ) as span:
+            plan, warnings = self._build_plan(request)
+            if span is not None:
+                span.update(
+                    output={
+                        'requires_sentiment': plan.requires_sentiment,
+                        'selected_competitors': len(plan.selected_competitors),
+                    }
+                )
+            return plan, warnings
 
     def _skipped_tool_record(
         self,
@@ -144,6 +181,13 @@ class BaseMarketAnalysisOrchestrator:
     ) -> AnalyzeResponse:
         deduplicated_warnings = list(dict.fromkeys(warnings))
         generated_at = datetime.now(timezone.utc)
+        sentiment_mode = 'skipped'
+        sentiment_record = next(
+            (item for item in tool_runs if item.tool_name == 'sentiment_tool' and item.status != 'skipped'),
+            None,
+        )
+        if sentiment_record is not None:
+            sentiment_mode = sentiment_record.details.get('effective_mode', sentiment_mode)
         return AnalyzeResponse(
             analysis_id=analysis_id,
             generated_at=generated_at,
@@ -159,7 +203,19 @@ class BaseMarketAnalysisOrchestrator:
             metadata={
                 'orchestration_mode': self.orchestration_mode,
                 'report_synthesis_mode': report.synthesis_mode,
+                'sentiment_analysis_mode': sentiment_mode,
                 'environment': self.settings.environment,
                 'thread_id': analysis_id,
+                **(
+                    {'langfuse_trace_id': self.current_langfuse_trace_id}
+                    if self.current_langfuse_trace_id
+                    else {}
+                ),
             },
         )
+
+    def _build_sentiment_tool_details(self, base_details: dict[str, Any], tool_details: dict[str, Any]) -> dict[str, Any]:
+        details = {**base_details, **tool_details}
+        details.setdefault('prompt_name', self.settings.sentiment_prompt_name)
+        details.setdefault('prompt_label', self.settings.sentiment_prompt_label)
+        return details

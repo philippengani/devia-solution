@@ -43,6 +43,16 @@ def test_workflow_diagram_endpoint():
     assert body['ascii']
 
 
+def test_architecture_diagram_endpoint():
+    response = client.get('/architecture/diagram')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['orchestration_mode'] == 'langgraph'
+    assert 'Langfuse' in body['mermaid']
+    assert 'OpenAI-compatible API' in body['mermaid']
+    assert 'ProductDataTool' in body['mermaid']
+
+
 def test_analyze_endpoint_llm_fallback_metadata(monkeypatch):
     monkeypatch.setenv('LLM_ENABLED', 'true')
     monkeypatch.setenv('LLM_API_KEY', 'sk-test')

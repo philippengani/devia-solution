@@ -5,6 +5,7 @@ from fastapi import APIRouter, HTTPException
 from app.core.config import get_settings
 from app.core.errors import AnalysisError
 from app.models.schemas import AnalyzeRequest, AnalyzeResponse
+from app.services.architecture_diagrams import render_runtime_architecture_mermaid
 from app.services.factory import get_orchestrator
 from app.services.langgraph_orchestrator import LangGraphMarketAnalysisOrchestrator
 
@@ -39,4 +40,15 @@ def workflow_diagram() -> dict[str, str]:
         'orchestration_mode': orchestrator.orchestration_mode,
         'mermaid': orchestrator.render_mermaid(),
         'ascii': orchestrator.render_ascii(),
+    }
+
+
+@router.get('/architecture/diagram')
+def architecture_diagram() -> dict[str, str]:
+    settings = get_settings()
+    return {
+        'orchestration_mode': settings.orchestration_mode,
+        'report_synthesis_mode': settings.report_synthesis_mode,
+        'sentiment_analysis_mode': settings.sentiment_analysis_mode,
+        'mermaid': render_runtime_architecture_mermaid(),
     }

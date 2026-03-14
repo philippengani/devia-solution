@@ -14,6 +14,7 @@ from app.services.report_narrative import ReportNarrativeService
 class ReportGeneratorTool:
     def __init__(self, narrative_service: ReportNarrativeService) -> None:
         self.narrative_service = narrative_service
+        self.last_run_details: dict[str, object] = {}
 
     def run(
         self,
@@ -22,8 +23,17 @@ class ReportGeneratorTool:
         product_data: list[ProductObservation],
         sentiment: SentimentOutput,
         trend: TrendOutput,
+        *,
+        trace_context=None,
     ) -> tuple[ReportOutput, list[str]]:
-        narrative = self.narrative_service.generate(request, product_data, sentiment, trend)
+        narrative = self.narrative_service.generate(
+            request,
+            product_data,
+            sentiment,
+            trend,
+            trace_context=trace_context,
+        )
+        self.last_run_details = dict(narrative.details)
         recommendations = self._build_recommendations(request, trend, sentiment, product_data)
         price_chart = self._build_price_chart(product_data)
         markdown = self._build_markdown(

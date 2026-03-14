@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import json
 import logging
+from typing import Any, Mapping, Optional
 
 import httpx
+from langfuse.openai import OpenAI as LangfuseOpenAI
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.config import Settings
 from app.models.schemas import AnalyzeRequest, ProductObservation, SentimentOutput, TrendOutput
@@ -18,11 +21,21 @@ class NarrativeDraft:
     key_findings: list[str]
     synthesis_mode: str
     warnings: list[str] = field(default_factory=list)
+    details: dict[str, Any] = field(default_factory=dict)
+
+
+class ReportLLMResponse(BaseModel):
+    model_config = ConfigDict(extra='ignore')
+
+    executive_summary: str
+    key_findings: list[str] = Field(default_factory=list)
 
 
 class ReportNarrativeService:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, *, langfuse_client=None, openai_client=None) -> None:
         self.settings = settings
+        self.langfuse_client = langfuse_client
+        self.openai_client = openai_client
 
     def generate(
         self,
@@ -30,10 +43,18 @@ class ReportNarrativeService:
         product_data: list[ProductObservation],
         sentiment: SentimentOutput,
         trend: TrendOutput,
+        *,
+        trace_context: Optional[Mapping[str, str]] = None,
     ) -> NarrativeDraft:
         if self._should_use_openai():
             try:
-                return self._generate_with_openai(request, product_data, sentiment, trend)
+                return self._generate_with_openai(
+                    request,
+                    product_data,
+                    sentiment,
+                    trend,
+                    trace_context=trace_context,
+                )
             except httpx.HTTPStatusError as exc:
                 logger.exception(
                     'OpenAI-compatible synthesis failed with HTTP error for product=%s market=%s model=%s status=%s response=%s',
@@ -68,6 +89,8 @@ class ReportNarrativeService:
             self.settings.report_synthesis_mode == 'openai_compatible'
             and self.settings.llm_enabled
             and bool(self.settings.llm_api_key)
+            and self.settings.langfuse_enabled
+            and self.langfuse_client is not None
         )
 
     def _generate_with_template(
@@ -100,6 +123,7 @@ class ReportNarrativeService:
             executive_summary=executive_summary,
             key_findings=key_findings,
             synthesis_mode='template',
+            details={'provider': 'template'},
         )
 
     def _generate_with_openai(
@@ -108,56 +132,62 @@ class ReportNarrativeService:
         product_data: list[ProductObservation],
         sentiment: SentimentOutput,
         trend: TrendOutput,
+        *,
+        trace_context: Optional[Mapping[str, str]] = None,
     ) -> NarrativeDraft:
-        payload = {
-            'model': self.settings.llm_model,
-            'temperature': 0.2,
-            'response_format': {'type': 'json_object'},
-            'messages': [
-                {
-                    'role': 'system',
-                    'content': (
-                        'You are a market-intelligence analyst. '
-                        'Return compact JSON with keys executive_summary and key_findings. '
-                        'key_findings must be a list of exactly 3 concise bullet strings.'
-                    ),
-                },
-                {
-                    'role': 'user',
-                    'content': json.dumps(
-                        {
-                            'request': request.model_dump(),
-                            'product_data': [item.model_dump() for item in product_data],
-                            'sentiment': sentiment.model_dump(),
-                            'trend': trend.model_dump(),
-                        }
-                    ),
-                },
-            ],
-        }
+        prompt = self.langfuse_client.get_prompt(
+            self.settings.report_prompt_name,
+            label=self.settings.report_prompt_label,
+            type='chat',
+            fetch_timeout_seconds=max(1, int(self.settings.request_timeout_seconds)),
+        )
+        compiled_prompt = prompt.compile(
+            request_json=json.dumps(request.model_dump(), ensure_ascii=True),
+            product_data_json=json.dumps([item.model_dump() for item in product_data], ensure_ascii=True),
+            sentiment_json=json.dumps(sentiment.model_dump(), ensure_ascii=True),
+            trend_json=json.dumps(trend.model_dump(), ensure_ascii=True),
+        )
+        response = self._get_openai_client().chat.completions.create(
+            model=self.settings.llm_model,
+            temperature=0.2,
+            response_format={'type': 'json_object'},
+            messages=compiled_prompt,
+            name='report-generation',
+            metadata={
+                'langfuse_prompt_name': prompt.name,
+                'product_name': request.product_name,
+                'market': request.market,
+            },
+            langfuse_prompt=prompt,
+            trace_id=trace_context.get('trace_id') if trace_context else None,
+            parent_observation_id=trace_context.get('parent_span_id') if trace_context else None,
+        )
 
-        headers = {
-            'Authorization': f'Bearer {self.settings.llm_api_key}',
-            'Content-Type': 'application/json',
-        }
-
-        with httpx.Client(timeout=self.settings.request_timeout_seconds) as client:
-            response = client.post(
-                f'{self.settings.llm_base_url}/chat/completions',
-                headers=headers,
-                json=payload,
-            )
-            response.raise_for_status()
-
-        content = response.json()['choices'][0]['message']['content']
-        parsed = json.loads(content)
+        content = response.choices[0].message.content or '{}'
+        parsed = ReportLLMResponse.model_validate(json.loads(content))
         return NarrativeDraft(
-            executive_summary=parsed['executive_summary'],
-            key_findings=list(parsed['key_findings']),
+            executive_summary=parsed.executive_summary,
+            key_findings=list(parsed.key_findings[:3]),
             synthesis_mode='openai_compatible',
+            details={
+                'provider': 'langfuse_openai',
+                'prompt_name': prompt.name,
+                'prompt_label': self.settings.report_prompt_label,
+                'prompt_version': prompt.version,
+                'prompt_labels': list(prompt.labels),
+            },
         )
 
     def _truncate_text(self, value: str, limit: int = 500) -> str:
         if len(value) <= limit:
             return value
         return f'{value[:limit]}...'
+
+    def _get_openai_client(self):
+        if self.openai_client is None:
+            self.openai_client = LangfuseOpenAI(
+                api_key=self.settings.llm_api_key,
+                base_url=self.settings.llm_base_url,
+                timeout=self.settings.request_timeout_seconds,
+            )
+        return self.openai_client
